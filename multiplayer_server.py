@@ -1,4 +1,5 @@
 import json
+import os
 import random
 import socket
 import threading
@@ -65,7 +66,30 @@ def send_json(sock, payload):
 
 rooms = {}
 rooms_lock = threading.Lock()
+leaderboard_lock = threading.Lock()
+leaderboard_path = os.path.join(os.path.dirname(__file__), "leaderboard.json")
 global_leaderboard = {}
+
+
+def load_global_leaderboard():
+    try:
+        with open(leaderboard_path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+            if isinstance(data, dict):
+                return data
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {}
+
+
+def save_global_leaderboard():
+    tmp_path = f"{leaderboard_path}.tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as handle:
+            json.dump(global_leaderboard, handle)
+        os.replace(tmp_path, leaderboard_path)
+    except OSError:
+        pass
 
 
 def get_or_create_room():
@@ -81,7 +105,8 @@ def get_or_create_room():
 
 
 def broadcast_room_state(room):
-    top_scores = sorted(global_leaderboard.items(), key=lambda item: item[1]["score"], reverse=True)[:10]
+    with leaderboard_lock:
+        top_scores = sorted(global_leaderboard.items(), key=lambda item: item[1]["score"], reverse=True)[:10]
     payload = room.to_payload()
     payload["global_leaderboard"] = [
         {"name": entry["name"], "score": entry["score"], "color": entry["color"]}
@@ -154,11 +179,16 @@ def handle_client(sock, addr):
             client.lives = int(message.get("lives", client.lives))
             if message.get("name"):
                 client.name = str(message["name"])[:24]
-            global_leaderboard[client.player_id] = {
-                "name": client.name,
-                "score": client.score,
-                "color": client.color,
-            }
+            if client.name:
+                with leaderboard_lock:
+                    current = global_leaderboard.get(client.name)
+                    if not current or client.score >= int(current.get("score", 0)):
+                        global_leaderboard[client.name] = {
+                            "name": client.name,
+                            "score": client.score,
+                            "color": client.color,
+                        }
+                        save_global_leaderboard()
 
             broadcast_room_state(room)
 
@@ -177,6 +207,8 @@ def handle_client(sock, addr):
 
 
 def main():
+    global global_leaderboard
+    global_leaderboard = load_global_leaderboard()
     print(f"Starting multiplayer server on {MULTIPLAYER_SERVER_HOST}:{MULTIPLAYER_SERVER_PORT}")
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

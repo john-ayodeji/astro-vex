@@ -44,6 +44,9 @@ STATE_RESPAWNING = "respawning"
 STATE_PAUSED = "paused"
 STATE_GAME_OVER = "game_over"
 STATE_SETTINGS = "settings"
+STATE_LEADERBOARD = "leaderboard"
+STATE_LOGIN = "login"
+STATE_ROUND_OVER = "round_over"
 
 
 def make_parallax_layers():
@@ -189,16 +192,20 @@ def main():
     home_ships = make_home_ships(5)
 
     menu_options = {
-        STATE_HOME: ["Start Solo", "Start Online", "Settings", "Quit"],
+        STATE_HOME: ["Start Solo", "Start Online", "Leaderboard", "Login", "Settings", "Quit"],
         STATE_PAUSED: ["Resume", "Restart", "Home", "Settings", "Quit"],
         STATE_GAME_OVER: ["Restart", "Home", "Settings", "Quit"],
         STATE_SETTINGS: ["Sound", "Volume", "Back"],
+        STATE_LEADERBOARD: ["Back"],
+        STATE_ROUND_OVER: ["View Results", "Home"],
     }
     menu_index = {
         STATE_HOME: 0,
         STATE_PAUSED: 0,
         STATE_GAME_OVER: 0,
         STATE_SETTINGS: 0,
+        STATE_LEADERBOARD: 0,
+        STATE_ROUND_OVER: 0,
     }
 
     settings_return_state = STATE_HOME
@@ -220,6 +227,13 @@ def main():
     status_message = ""
     status_until = 0
     achievement_toasts = deque()
+    player_profile_name = "Guest"
+    login_name = ""
+    login_error = ""
+    online_round_over = False
+    online_winner_id = None
+    online_standings = []
+    last_auto_connect_attempt = -999.0
 
     shake_timer = 0
     shake_intensity = 0
@@ -333,6 +347,9 @@ def main():
             set_status("Server timeout", duration=4)
             return False
 
+        if player_profile_name and player_profile_name != "Guest":
+            online_client.player_name = player_profile_name
+
         set_status(f"Joined room {online_client.room_id}", duration=3)
         return True
 
@@ -341,7 +358,7 @@ def main():
         state = next_state
 
     def handle_menu_action(action):
-        nonlocal settings_return_state, running
+        nonlocal settings_return_state, running, login_name, login_error
         if action == "Start Solo":
             sounds.play("menu_select")
             start_new_game(use_online=False)
@@ -359,6 +376,17 @@ def main():
             sounds.play("menu_select")
             close_online_client()
             change_state(STATE_HOME)
+        elif action == "Leaderboard":
+            sounds.play("menu_select")
+            if online_client is None or not online_client.connected:
+                connect_online()
+            change_state(STATE_LEADERBOARD)
+            menu_index[STATE_LEADERBOARD] = 0
+        elif action == "Login":
+            sounds.play("menu_select")
+            login_name = "" if player_profile_name == "Guest" else player_profile_name
+            login_error = ""
+            change_state(STATE_LOGIN)
         elif action == "Settings":
             sounds.play("menu_select")
             settings_return_state = state
@@ -382,9 +410,56 @@ def main():
         else:
             score += 20
 
+    def auto_connect_on_home():
+        nonlocal last_auto_connect_attempt
+        if state != STATE_HOME or online_mode:
+            return
+        if online_client is not None and online_client.connected:
+            return
+        if elapsed - last_auto_connect_attempt < 6:
+            return
+        last_auto_connect_attempt = elapsed
+        connect_online()
+
+    def ordinal(n):
+        if 10 <= n % 100 <= 20:
+            suffix = "th"
+        else:
+            suffix = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+        return f"{n}{suffix}"
+
+    def recompute_online_standings():
+        nonlocal online_round_over, online_winner_id, online_standings
+        if not online_mode or online_client is None:
+            online_round_over = False
+            online_winner_id = None
+            online_standings = []
+            return
+
+        players = list(online_client.players.values())
+        if not players:
+            online_round_over = False
+            online_winner_id = None
+            online_standings = []
+            return
+
+        alive = [p for p in players if int(p.get("lives", 0)) > 0]
+        eliminated = [p for p in players if int(p.get("lives", 0)) <= 0]
+        alive_sorted = sorted(alive, key=lambda p: int(p.get("score", 0)), reverse=True)
+        eliminated_sorted = sorted(eliminated, key=lambda p: int(p.get("score", 0)), reverse=True)
+        online_standings = alive_sorted + eliminated_sorted
+
+        if len(alive_sorted) == 1 and len(players) >= 2:
+            online_round_over = True
+            online_winner_id = alive_sorted[0].get("player_id")
+        else:
+            online_round_over = False
+            online_winner_id = None
+
     running = True
     while running:
         elapsed += dt
+        auto_connect_on_home()
         update_parallax(parallax_layers, dt)
         update_home_background(home_ships, dt)
 
@@ -409,7 +484,28 @@ def main():
                     else:
                         set_status("Drone cannot upgrade further", duration=2)
 
-                elif state in (STATE_HOME, STATE_PAUSED, STATE_GAME_OVER, STATE_SETTINGS):
+                elif state == STATE_LOGIN:
+                    if event.key == pygame.K_ESCAPE:
+                        sounds.play("menu_move")
+                        change_state(STATE_HOME)
+                    elif event.key == pygame.K_BACKSPACE:
+                        login_name = login_name[:-1]
+                        login_error = ""
+                    elif event.key == pygame.K_RETURN:
+                        stripped = login_name.strip()
+                        if not stripped:
+                            login_error = "Name cannot be empty."
+                        else:
+                            player_profile_name = stripped[:16]
+                            login_error = ""
+                            sounds.play("menu_select")
+                            change_state(STATE_HOME)
+                    else:
+                        if event.unicode and event.unicode.isprintable():
+                            if len(login_name) < 16:
+                                login_name += event.unicode
+                                login_error = ""
+                elif state in (STATE_HOME, STATE_PAUSED, STATE_GAME_OVER, STATE_SETTINGS, STATE_LEADERBOARD, STATE_ROUND_OVER):
                     if event.key == pygame.K_UP:
                         menu_index[state] = (menu_index[state] - 1) % len(menu_options[state])
                         sounds.play("menu_move")
@@ -425,6 +521,20 @@ def main():
                             elif current == "Back":
                                 sounds.play("menu_select")
                                 change_state(settings_return_state)
+                        elif state == STATE_LEADERBOARD:
+                            current = menu_options[STATE_LEADERBOARD][menu_index[STATE_LEADERBOARD]]
+                            if current == "Back":
+                                sounds.play("menu_select")
+                                change_state(STATE_HOME)
+                        elif state == STATE_ROUND_OVER:
+                            current = menu_options[STATE_ROUND_OVER][menu_index[STATE_ROUND_OVER]]
+                            if current == "View Results":
+                                sounds.play("menu_select")
+                                change_state(STATE_GAME_OVER)
+                            elif current == "Home":
+                                sounds.play("menu_select")
+                                close_online_client()
+                                change_state(STATE_HOME)
                         else:
                             current = menu_options[state][menu_index[state]]
                             handle_menu_action(current)
@@ -438,6 +548,12 @@ def main():
                         if state == STATE_SETTINGS:
                             sounds.play("menu_move")
                             change_state(settings_return_state)
+                        elif state == STATE_LEADERBOARD:
+                            sounds.play("menu_move")
+                            change_state(STATE_HOME)
+                        elif state == STATE_ROUND_OVER:
+                            sounds.play("menu_move")
+                            change_state(STATE_GAME_OVER)
                         elif state == STATE_PAUSED:
                             sounds.play("menu_move")
                             change_state(STATE_PLAYING)
@@ -523,6 +639,15 @@ def main():
                     lives -= 1
 
                     if lives <= 0:
+                        if online_mode and online_client is not None:
+                            online_client.send_state(
+                                player.position.x,
+                                player.position.y,
+                                player.rotation,
+                                score,
+                                lives,
+                                name=player.name,
+                            )
                         game_over_score = score
                         menu_index[STATE_GAME_OVER] = 0
                         change_state(STATE_GAME_OVER)
@@ -583,6 +708,11 @@ def main():
                         lives,
                         name=player.name,
                     )
+                recompute_online_standings()
+                if online_round_over and state == STATE_PLAYING:
+                    game_over_score = score
+                    menu_index[STATE_ROUND_OVER] = 0
+                    change_state(STATE_ROUND_OVER)
 
         elif state == STATE_RESPAWNING:
             sounds.update_music_mode("calm")
@@ -593,7 +723,7 @@ def main():
                 sounds.play("respawn")
                 log_event("player_respawn", lives_remaining=lives)
                 change_state(STATE_PLAYING)
-        elif state in (STATE_HOME, STATE_SETTINGS, STATE_PAUSED, STATE_GAME_OVER):
+        elif state in (STATE_HOME, STATE_SETTINGS, STATE_PAUSED, STATE_GAME_OVER, STATE_LEADERBOARD, STATE_LOGIN, STATE_ROUND_OVER):
             sounds.update_music_mode("calm")
 
         if state in (STATE_HOME,) or (state == STATE_SETTINGS and settings_return_state == STATE_HOME):
@@ -641,31 +771,32 @@ def main():
                             radius=18,
                         )
 
-                    room_board = sorted(
-                        online_client.players.values(),
-                        key=lambda p: int(p.get("score", 0)),
-                        reverse=True,
-                    )[:6]
-                    draw_panel(frame_surface, SCREEN_WIDTH - 280, 16, 250, 180, alpha=160)
+                    recompute_online_standings()
+                    room_board = online_standings[:6]
+                    draw_panel(frame_surface, SCREEN_WIDTH - 300, 16, 270, 190, alpha=160)
                     frame_surface.blit(
                         hud_font.render(f"Room {online_client.room_id}", True, "#93c5fd"),
-                        (SCREEN_WIDTH - 260, 28),
+                        (SCREEN_WIDTH - 282, 28),
                     )
                     for i, entry in enumerate(room_board):
                         name = entry.get("name", "Pilot")
                         player_score = entry.get("score", 0)
                         color = entry.get("color", "white")
-                        line = f"{i + 1}. {name[:10]}  {player_score}"
-                        frame_surface.blit(hud_font.render(line, True, color), (SCREEN_WIDTH - 260, 54 + i * 22))
+                        lives_left = int(entry.get("lives", 0))
+                        status = "OUT" if lives_left <= 0 else ordinal(i + 1)
+                        if online_round_over and entry.get("player_id") == online_winner_id:
+                            status = "WINNER"
+                        line = f"{status:<6} {name[:10]}  {player_score}"
+                        frame_surface.blit(hud_font.render(line, True, color), (SCREEN_WIDTH - 282, 54 + i * 24))
 
                     if online_client.global_leaderboard:
-                        draw_panel(frame_surface, SCREEN_WIDTH - 280, 204, 250, 192, alpha=150)
-                        frame_surface.blit(hud_font.render("Global", True, "#facc15"), (SCREEN_WIDTH - 260, 216))
+                        draw_panel(frame_surface, SCREEN_WIDTH - 300, 212, 270, 192, alpha=150)
+                        frame_surface.blit(hud_font.render("Global", True, "#facc15"), (SCREEN_WIDTH - 282, 224))
                         for i, entry in enumerate(online_client.global_leaderboard[:6]):
-                            line = f"{i + 1}. {entry['name'][:10]} {entry['score']}"
+                            line = f"{ordinal(i + 1):<6} {entry['name'][:10]} {entry['score']}"
                             frame_surface.blit(
                                 hud_font.render(line, True, entry.get("color", "white")),
-                                (SCREEN_WIDTH - 260, 242 + i * 22),
+                                (SCREEN_WIDTH - 282, 250 + i * 22),
                             )
 
         if state == STATE_HOME:
@@ -678,11 +809,18 @@ def main():
                 182,
                 color="#94a3b8",
             )
+            draw_center_text(
+                frame_surface,
+                sub_font,
+                f"Pilot: {player_profile_name}",
+                204,
+                color="#cbd5e1",
+            )
 
-            draw_panel(frame_surface, SCREEN_WIDTH // 2 - 220, 230, 440, 280)
+            draw_panel(frame_surface, SCREEN_WIDTH // 2 - 240, 230, 480, 320)
             for i, option in enumerate(menu_options[STATE_HOME]):
                 color = "#4ade80" if i == menu_index[STATE_HOME] else "white"
-                draw_center_text(frame_surface, menu_font, option, 276 + i * 52, color=color)
+                draw_center_text(frame_surface, menu_font, option, 276 + i * 46, color=color)
 
         elif state == STATE_PAUSED:
             overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
@@ -715,16 +853,81 @@ def main():
 
             draw_center_text(frame_surface, sub_font, "Esc to return", 390, color="#94a3b8")
 
+        elif state == STATE_LEADERBOARD:
+            overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+            overlay.fill((0, 0, 0, 150))
+            frame_surface.blit(overlay, (0, 0))
+            draw_panel(frame_surface, SCREEN_WIDTH // 2 - 280, 110, 560, 420)
+            draw_center_text(frame_surface, overlay_font, "LEADERBOARD", 160, color="white")
+
+            if not online_client or not online_client.connected:
+                draw_center_text(
+                    frame_surface,
+                    sub_font,
+                    "Connect to the server to load the global leaderboard.",
+                    230,
+                    color="#cbd5e1",
+                )
+                draw_center_text(
+                    frame_surface,
+                    sub_font,
+                    "Start Online or wait here after connecting.",
+                    258,
+                    color="#94a3b8",
+                )
+            elif online_client.global_leaderboard:
+                for i, entry in enumerate(online_client.global_leaderboard[:10]):
+                    line = f"{ordinal(i + 1):<6} {entry['name'][:16]} {entry['score']}"
+                    frame_surface.blit(
+                        menu_font.render(line, True, entry.get("color", "white")),
+                        (SCREEN_WIDTH // 2 - 220, 220 + i * 28),
+                    )
+            else:
+                draw_center_text(frame_surface, sub_font, "Leaderboard is warming up...", 240, color="#cbd5e1")
+
+            for i, option in enumerate(menu_options[STATE_LEADERBOARD]):
+                color = "#4ade80" if i == menu_index[STATE_LEADERBOARD] else "white"
+                draw_center_text(frame_surface, menu_font, option, 500 + i * 42, color=color)
+
         elif state == STATE_GAME_OVER:
             overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
             overlay.fill((0, 0, 0, 160))
             frame_surface.blit(overlay, (0, 0))
             draw_panel(frame_surface, SCREEN_WIDTH // 2 - 250, 110, 500, 360)
             draw_center_text(frame_surface, overlay_font, "GAME OVER", 166, color="orangered")
+            if online_mode and online_round_over and online_winner_id == online_client.player_id:
+                draw_center_text(frame_surface, menu_font, "YOU WIN!", 210, color="#4ade80")
+            elif online_mode and online_round_over and online_winner_id:
+                winner_name = None
+                for entry in online_standings:
+                    if entry.get("player_id") == online_winner_id:
+                        winner_name = entry.get("name", "Winner")
+                        break
+                if winner_name:
+                    draw_center_text(frame_surface, sub_font, f"Winner: {winner_name}", 208, color="#facc15")
             draw_center_text(frame_surface, menu_font, f"Final Score: {game_over_score}", 230, color="white")
             for i, option in enumerate(menu_options[STATE_GAME_OVER]):
                 color = "#4ade80" if i == menu_index[STATE_GAME_OVER] else "white"
                 draw_center_text(frame_surface, menu_font, option, 290 + i * 46, color=color)
+
+        elif state == STATE_ROUND_OVER:
+            overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+            overlay.fill((0, 0, 0, 180))
+            frame_surface.blit(overlay, (0, 0))
+            draw_panel(frame_surface, SCREEN_WIDTH // 2 - 260, 120, 520, 340)
+            draw_center_text(frame_surface, overlay_font, "ROUND OVER", 180, color="white")
+            if online_winner_id:
+                winner_name = None
+                for entry in online_standings:
+                    if entry.get("player_id") == online_winner_id:
+                        winner_name = entry.get("name", "Winner")
+                        break
+                if winner_name:
+                    draw_center_text(frame_surface, menu_font, f"Winner: {winner_name}", 240, color="#facc15")
+            draw_center_text(frame_surface, sub_font, "Gameplay paused", 280, color="#94a3b8")
+            for i, option in enumerate(menu_options[STATE_ROUND_OVER]):
+                color = "#4ade80" if i == menu_index[STATE_ROUND_OVER] else "white"
+                draw_center_text(frame_surface, menu_font, option, 330 + i * 46, color=color)
 
         elif state == STATE_RESPAWNING:
             overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
@@ -733,6 +936,19 @@ def main():
             countdown_display = max(1, int(respawn_countdown_timer) + 1)
             draw_center_text(frame_surface, overlay_font, f"RESPAWNING {countdown_display}", SCREEN_HEIGHT // 2 - 20)
             draw_center_text(frame_surface, sub_font, "Get ready...", SCREEN_HEIGHT // 2 + 28, color="lightgray")
+
+        elif state == STATE_LOGIN:
+            overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+            overlay.fill((0, 0, 0, 150))
+            frame_surface.blit(overlay, (0, 0))
+            draw_panel(frame_surface, SCREEN_WIDTH // 2 - 280, 140, 560, 320)
+            draw_center_text(frame_surface, overlay_font, "LOGIN", 200, color="white")
+            draw_center_text(frame_surface, sub_font, "Enter a pilot name to appear on the leaderboard.", 240, color="#cbd5e1")
+            name_display = login_name if login_name else "_"
+            draw_center_text(frame_surface, menu_font, name_display[:16], 290, color="#facc15")
+            draw_center_text(frame_surface, sub_font, "Enter to save, Esc to cancel", 340, color="#94a3b8")
+            if login_error:
+                draw_center_text(frame_surface, sub_font, login_error, 370, color="#fca5a5")
 
         now_toasts = deque()
         for notification, expiry in achievement_toasts:
