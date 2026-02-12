@@ -112,4 +112,3 @@ Contributions are welcome.
 ## Notes
 - Generated logs are ignored by git: `game_state.jsonl`, `game_events.jsonl`.
 - Gameplay/network tuning lives in `constants.py`.
-- Per your request, every future feature change also updates this README.
