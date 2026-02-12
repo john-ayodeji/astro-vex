@@ -3,7 +3,7 @@ import random
 
 import pygame.draw
 
-from constants import LINE_WIDTH, ASTEROID_MIN_RADIUS
+from constants import LINE_WIDTH, ASTEROID_MIN_RADIUS, ASTEROID_MAX_RADIUS
 from circleshape import CircleShape
 from explosion import Explosion
 from logger import log_event
@@ -13,12 +13,15 @@ class Asteroid(CircleShape):
     def __init__(self, x, y, radius):
         super().__init__(x, y, radius)
         self.shape_points = self._generate_lumpy_points()
+        self.is_boss = radius > ASTEROID_MAX_RADIUS
 
     def draw(self, screen):
         world_points = [
             (self.position.x + point.x, self.position.y + point.y)
             for point in self.shape_points
         ]
+        fill_color = "#f59e0b" if self.is_boss else "#94a3b8"
+        pygame.draw.polygon(screen, fill_color, world_points)
         pygame.draw.polygon(screen, "white", world_points, LINE_WIDTH)
 
     def update(self, dt):

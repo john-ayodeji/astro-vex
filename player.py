@@ -26,9 +26,11 @@ from shot import Shot
 class Player(CircleShape):
     WEAPON_NAMES = ["Single", "Spread", "Rapid"]
 
-    def __init__(self, x, y):
+    def __init__(self, x, y, color="white", name="You"):
         super().__init__(x, y, PLAYER_RADIUS)
         self.rotation = 0
+        self.color = color
+        self.name = name
         self.shoot_cooldown_timer = 0
         self.bomb_cooldown_timer = 0
         self.space_was_pressed = False
@@ -43,15 +45,52 @@ class Player(CircleShape):
         self.action_callback = None
 
     def triangle(self):
+        ship = self.ship_geometry()
+        return [ship["nose"], ship["left_wing"], ship["right_wing"]]
+
+    def ship_geometry(self):
         forward = pygame.Vector2(0, 1).rotate(self.rotation)
-        right = pygame.Vector2(0, 1).rotate(self.rotation + 90) * self.radius / 1.5
-        a = self.position + forward * self.radius
-        b = self.position - forward * self.radius - right
-        c = self.position - forward * self.radius + right
-        return [a, b, c]
+        right = pygame.Vector2(0, 1).rotate(self.rotation + 90)
+        nose = self.position + forward * self.radius * 1.25
+        tail = self.position - forward * self.radius * 0.95
+        left_wing = self.position - forward * self.radius * 0.45 - right * self.radius * 0.9
+        right_wing = self.position - forward * self.radius * 0.45 + right * self.radius * 0.9
+        left_hull = self.position + forward * self.radius * 0.25 - right * self.radius * 0.55
+        right_hull = self.position + forward * self.radius * 0.25 + right * self.radius * 0.55
+        canopy = self.position + forward * self.radius * 0.2
+        return {
+            "nose": nose,
+            "tail": tail,
+            "left_wing": left_wing,
+            "right_wing": right_wing,
+            "left_hull": left_hull,
+            "right_hull": right_hull,
+            "canopy": canopy,
+        }
 
     def draw(self, screen):
-        pygame.draw.polygon(screen, "white", self.triangle(), LINE_WIDTH)
+        ship = self.ship_geometry()
+        hull = [
+            ship["nose"],
+            ship["right_hull"],
+            ship["right_wing"],
+            ship["tail"],
+            ship["left_wing"],
+            ship["left_hull"],
+        ]
+        pygame.draw.polygon(screen, self.color, hull)
+        pygame.draw.polygon(screen, "white", hull, LINE_WIDTH)
+
+        canopy_color = pygame.Color(self.color)
+        canopy_color.r = min(255, canopy_color.r + 60)
+        canopy_color.g = min(255, canopy_color.g + 60)
+        canopy_color.b = min(255, canopy_color.b + 60)
+        pygame.draw.circle(
+            screen,
+            canopy_color,
+            (ship["canopy"].x, ship["canopy"].y),
+            self.radius * 0.25,
+        )
 
         if self.shield_timer > 0:
             pygame.draw.circle(

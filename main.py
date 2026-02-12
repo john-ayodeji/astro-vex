@@ -1,22 +1,37 @@
 import random
+import time
+from collections import deque
 
 import pygame
 
+from achievements import AchievementTracker
 from asteroids import Asteroid
 from asteroidfield import AsteroidField
 from bomb import Bomb
 from constants import (
     ASTEROID_MIN_RADIUS,
     GAME_TITLE,
+    MULTIPLAYER_SERVER_HOST,
+    MULTIPLAYER_SERVER_PORT,
+    NETWORK_SEND_INTERVAL_SECONDS,
+    PARALLAX_LAYER_COUNTS,
+    PARALLAX_LAYER_SPEEDS,
     PLAYER_RESPAWN_COUNTDOWN_SECONDS,
     PLAYER_RESPAWN_INVULNERABLE_SECONDS,
     PLAYER_STARTING_LIVES,
     POWERUP_SPAWN_SECONDS,
     SCREEN_HEIGHT,
+    SCREEN_SHAKE_BASE_DURATION_SECONDS,
+    SCREEN_SHAKE_BOMB_INTENSITY,
+    SCREEN_SHAKE_BOSS_DEATH_INTENSITY,
+    SCREEN_SHAKE_EXPLOSION_INTENSITY,
     SCREEN_WIDTH,
+    WAVE_DURATION_SECONDS,
 )
+from drone import CompanionDrone
 from explosion import Explosion
 from logger import log_event, log_state
+from multiplayer_client import MultiplayerClient
 from player import Player
 from powerup import ShieldPowerUp, SpeedPowerUp
 from shot import Shot
@@ -31,18 +46,21 @@ STATE_GAME_OVER = "game_over"
 STATE_SETTINGS = "settings"
 
 
-def make_stars(count):
-    stars = []
-    for _ in range(count):
-        stars.append(
-            {
-                "x": random.uniform(0, SCREEN_WIDTH),
-                "y": random.uniform(0, SCREEN_HEIGHT),
-                "speed": random.uniform(12, 70),
-                "size": random.randint(1, 3),
-            }
-        )
-    return stars
+def make_parallax_layers():
+    layers = []
+    for count, speed in zip(PARALLAX_LAYER_COUNTS, PARALLAX_LAYER_SPEEDS):
+        stars = []
+        for _ in range(count):
+            stars.append(
+                {
+                    "x": random.uniform(0, SCREEN_WIDTH),
+                    "y": random.uniform(0, SCREEN_HEIGHT),
+                    "speed": speed,
+                    "size": max(1, int(speed / 24)),
+                }
+            )
+        layers.append(stars)
+    return layers
 
 
 def make_home_ships(count):
@@ -59,6 +77,7 @@ def make_home_ships(count):
                 "speed": random.uniform(30, 80) * direction,
                 "size": random.uniform(0.5, 1.1),
                 "phase": random.uniform(0, 6.283),
+                "color": random.choice(["#7dd3fc", "#a7f3d0", "#fca5a5", "#fcd34d"]),
             }
         )
     return ships
@@ -70,39 +89,73 @@ def draw_center_text(screen, font, text, y, color="white"):
     screen.blit(text_surface, text_rect)
 
 
-def draw_home_background(screen, stars, home_ships, elapsed):
-    screen.fill((4, 8, 20))
+def draw_panel(screen, x, y, width, height, alpha=170):
+    panel = pygame.Surface((width, height), pygame.SRCALPHA)
+    panel.fill((7, 14, 28, alpha))
+    pygame.draw.rect(panel, (60, 130, 180, 210), panel.get_rect(), 2, border_radius=16)
+    screen.blit(panel, (x, y))
 
-    for star in stars:
-        pygame.draw.circle(screen, (220, 230, 255), (star["x"], star["y"]), star["size"])
+
+def ship_hull_points(position, rotation, radius):
+    forward = pygame.Vector2(0, 1).rotate(rotation)
+    right = pygame.Vector2(0, 1).rotate(rotation + 90)
+    nose = position + forward * radius * 1.25
+    tail = position - forward * radius * 0.95
+    left_wing = position - forward * radius * 0.45 - right * radius * 0.9
+    right_wing = position - forward * radius * 0.45 + right * radius * 0.9
+    left_hull = position + forward * radius * 0.25 - right * radius * 0.55
+    right_hull = position + forward * radius * 0.25 + right * radius * 0.55
+    canopy = position + forward * radius * 0.2
+    return [nose, right_hull, right_wing, tail, left_wing, left_hull], canopy
+
+
+def draw_remote_ship(screen, x, y, rotation, color, name, radius=20):
+    position = pygame.Vector2(x, y)
+    hull, canopy = ship_hull_points(position, rotation, radius)
+    pygame.draw.polygon(screen, color, hull)
+    pygame.draw.polygon(screen, "white", hull, 2)
+    pygame.draw.circle(screen, "white", (canopy.x, canopy.y), radius * 0.2, 1)
+
+    font = pygame.font.SysFont(None, 22)
+    text = font.render(name, True, color)
+    rect = text.get_rect(center=(x, y - radius - 12))
+    screen.blit(text, rect)
+
+
+def draw_parallax_background(screen, layers):
+    screen.fill((4, 8, 20))
+    shades = [(130, 148, 190), (180, 205, 240), (230, 240, 255)]
+    for i, stars in enumerate(layers):
+        color = shades[min(i, len(shades) - 1)]
+        for star in stars:
+            pygame.draw.circle(screen, color, (star["x"], star["y"]), star["size"])
+
+
+def draw_home_background(screen, layers, home_ships, elapsed):
+    draw_parallax_background(screen, layers)
 
     for ship in home_ships:
         wobble = 12 * pygame.math.Vector2(0, 1).rotate(elapsed * 60 + ship["phase"]).y
         cx = ship["x"]
         cy = ship["y"] + wobble
         scale = ship["size"]
-        points = [
-            (cx, cy - 24 * scale),
-            (cx - 16 * scale, cy + 18 * scale),
-            (cx + 16 * scale, cy + 18 * scale),
-        ]
-        pygame.draw.polygon(screen, (200, 235, 255), points, 2)
-        pygame.draw.line(
-            screen,
-            (90, 220, 255),
-            (cx, cy + 20 * scale),
-            (cx, cy + 34 * scale),
-            2,
-        )
+        position = pygame.Vector2(cx, cy)
+        hull, canopy = ship_hull_points(position, 0, 20 * scale)
+        pygame.draw.polygon(screen, ship["color"], hull)
+        pygame.draw.polygon(screen, "white", hull, 2)
+        pygame.draw.circle(screen, "white", (canopy.x, canopy.y), 3, 1)
 
 
-def update_home_background(stars, home_ships, dt):
-    for star in stars:
-        star["y"] += star["speed"] * dt
-        if star["y"] > SCREEN_HEIGHT:
-            star["y"] = 0
-            star["x"] = random.uniform(0, SCREEN_WIDTH)
+def update_parallax(layers, dt):
+    for stars in layers:
+        for star in stars:
+            star["y"] += star["speed"] * dt
+            if star["y"] > SCREEN_HEIGHT:
+                star["y"] = 0
+                star["x"] = random.uniform(0, SCREEN_WIDTH)
 
+
+def update_home_background(home_ships, dt):
     for ship in home_ships:
         ship["x"] += ship["speed"] * dt
         margin = 70
@@ -124,18 +177,19 @@ def main():
     screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
 
     title_font = pygame.font.SysFont(None, 96)
-    menu_font = pygame.font.SysFont(None, 46)
-    hud_font = pygame.font.SysFont(None, 30)
+    menu_font = pygame.font.SysFont(None, 42)
+    hud_font = pygame.font.SysFont(None, 28)
     overlay_font = pygame.font.SysFont(None, 76)
-    sub_font = pygame.font.SysFont(None, 28)
+    sub_font = pygame.font.SysFont(None, 24)
 
     sounds = SoundManager()
+    achievements = AchievementTracker()
 
-    stars = make_stars(140)
-    home_ships = make_home_ships(4)
+    parallax_layers = make_parallax_layers()
+    home_ships = make_home_ships(5)
 
     menu_options = {
-        STATE_HOME: ["Start", "Settings", "Quit"],
+        STATE_HOME: ["Start Solo", "Start Online", "Settings", "Quit"],
         STATE_PAUSED: ["Resume", "Restart", "Home", "Settings", "Quit"],
         STATE_GAME_OVER: ["Restart", "Home", "Settings", "Quit"],
         STATE_SETTINGS: ["Sound", "Volume", "Back"],
@@ -157,14 +211,44 @@ def main():
     respawn_invulnerable_timer = 0
     respawn_countdown_timer = 0
     game_over_score = 0
+    wave_number = 1
+    wave_timer = 0
+
+    online_client = None
+    online_mode = False
+    network_send_timer = 0
+    status_message = ""
+    status_until = 0
+    achievement_toasts = deque()
+
+    shake_timer = 0
+    shake_intensity = 0
+
+    def trigger_shake(intensity, duration=SCREEN_SHAKE_BASE_DURATION_SECONDS):
+        nonlocal shake_timer, shake_intensity
+        shake_timer = max(shake_timer, duration)
+        shake_intensity = max(shake_intensity, intensity)
+
+    def set_status(message, duration=3):
+        nonlocal status_message, status_until
+        status_message = message
+        status_until = elapsed + duration
 
     def on_player_action(action_name):
         if action_name == "shoot":
             sounds.play("shoot")
         elif action_name == "bomb_drop":
             sounds.play("bomb_drop")
+            trigger_shake(SCREEN_SHAKE_BOMB_INTENSITY, SCREEN_SHAKE_BASE_DURATION_SECONDS)
 
-    def create_game_world():
+    def close_online_client():
+        nonlocal online_client, online_mode
+        if online_client is not None:
+            online_client.close()
+        online_client = None
+        online_mode = False
+
+    def create_game_world(player_color="white", player_name="You"):
         updatable = pygame.sprite.Group()
         drawable = pygame.sprite.Group()
         asteroids = pygame.sprite.Group()
@@ -178,12 +262,14 @@ def main():
         Bomb.containers = (bombs, updatable, drawable)
         ShieldPowerUp.containers = (powerups, updatable, drawable)
         SpeedPowerUp.containers = (powerups, updatable, drawable)
+        CompanionDrone.containers = (updatable, drawable)
         Explosion.containers = (updatable, drawable)
         AsteroidField.containers = (updatable,)
 
-        player = Player(SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2)
+        player = Player(SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2, color=player_color, name=player_name)
         player.action_callback = on_player_action
         asteroid_field = AsteroidField()
+        drone = CompanionDrone(player, asteroids)
 
         return {
             "updatable": updatable,
@@ -193,38 +279,85 @@ def main():
             "bombs": bombs,
             "powerups": powerups,
             "player": player,
+            "drone": drone,
             "asteroid_field": asteroid_field,
         }
 
-    def start_new_game():
+    def start_new_game(use_online=False):
         nonlocal game, score, lives, powerup_spawn_timer
         nonlocal respawn_invulnerable_timer, respawn_countdown_timer, state
-        game = create_game_world()
+        nonlocal online_mode, network_send_timer, wave_number, wave_timer
+
+        if not use_online:
+            close_online_client()
+
+        player_color = "white"
+        player_name = "You"
+        if use_online and online_client is not None and online_client.connected:
+            player_color = online_client.player_color
+            player_name = online_client.player_name
+
+        game = create_game_world(player_color=player_color, player_name=player_name)
         score = 0
         lives = PLAYER_STARTING_LIVES
         powerup_spawn_timer = 0
         respawn_invulnerable_timer = 0
         respawn_countdown_timer = 0
+        network_send_timer = 0
+        wave_number = 1
+        wave_timer = 0
+        achievements.start_new_run()
+        achievement_toasts.clear()
+        online_mode = use_online
         state = STATE_PLAYING
-        log_event("game_started")
+        log_event("game_started", online=online_mode)
+
+    def connect_online():
+        nonlocal online_client
+        close_online_client()
+        online_client = MultiplayerClient()
+
+        try:
+            online_client.connect()
+        except OSError:
+            close_online_client()
+            set_status("Unable to reach multiplayer server", duration=4)
+            return False
+
+        deadline = time.monotonic() + 2.5
+        while time.monotonic() < deadline and not online_client.connected:
+            time.sleep(0.02)
+
+        if not online_client.connected:
+            close_online_client()
+            set_status("Server timeout", duration=4)
+            return False
+
+        set_status(f"Joined room {online_client.room_id}", duration=3)
+        return True
 
     def change_state(next_state):
         nonlocal state
         state = next_state
 
     def handle_menu_action(action):
-        nonlocal settings_return_state, state, running
-        if action == "Start":
+        nonlocal settings_return_state, running
+        if action == "Start Solo":
             sounds.play("menu_select")
-            start_new_game()
+            start_new_game(use_online=False)
+        elif action == "Start Online":
+            sounds.play("menu_select")
+            if connect_online():
+                start_new_game(use_online=True)
         elif action == "Resume":
             sounds.play("menu_select")
             change_state(STATE_PLAYING)
         elif action == "Restart":
             sounds.play("menu_select")
-            start_new_game()
+            start_new_game(use_online=online_mode)
         elif action == "Home":
             sounds.play("menu_select")
+            close_online_client()
             change_state(STATE_HOME)
         elif action == "Settings":
             sounds.play("menu_select")
@@ -252,7 +385,8 @@ def main():
     running = True
     while running:
         elapsed += dt
-        update_home_background(stars, home_ships, dt)
+        update_parallax(parallax_layers, dt)
+        update_home_background(home_ships, dt)
 
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
@@ -266,6 +400,14 @@ def main():
                 elif state == STATE_RESPAWNING and event.key == pygame.K_ESCAPE:
                     sounds.play("menu_move")
                     change_state(STATE_PAUSED)
+
+                elif state == STATE_PLAYING and event.key == pygame.K_u and game:
+                    drone = game.get("drone")
+                    if drone and drone.alive() and drone.upgrade():
+                        sounds.play("drone_upgrade")
+                        set_status(f"Drone upgraded to Lv {drone.level}", duration=2)
+                    else:
+                        set_status("Drone cannot upgrade further", duration=2)
 
                 elif state in (STATE_HOME, STATE_PAUSED, STATE_GAME_OVER, STATE_SETTINGS):
                     if event.key == pygame.K_UP:
@@ -304,6 +446,12 @@ def main():
             log_state()
             game["updatable"].update(dt)
 
+            wave_timer += dt
+            if wave_timer >= WAVE_DURATION_SECONDS:
+                wave_timer -= WAVE_DURATION_SECONDS
+                wave_number += 1
+                achievements.on_wave_change(wave_number)
+
             if respawn_invulnerable_timer > 0:
                 respawn_invulnerable_timer -= dt
 
@@ -335,12 +483,26 @@ def main():
                 if bomb.ready_to_detonate():
                     blast_position, blast_radius = bomb.detonate()
                     sounds.play("explosion")
+                    trigger_shake(SCREEN_SHAKE_BOMB_INTENSITY, SCREEN_SHAKE_BASE_DURATION_SECONDS * 1.4)
                     log_event("bomb_detonated")
+
+                    hit_count = 0
                     for asteroid in list(game["asteroids"]):
                         if asteroid.position.distance_to(blast_position) <= blast_radius + asteroid.radius:
+                            hit_count += 1
                             add_score_for_asteroid(asteroid)
+                            achievements.record_asteroid_destroyed(elapsed)
+                            was_boss = asteroid.is_boss
                             asteroid.split()
+                            if was_boss:
+                                sounds.play("boss_death")
+                                trigger_shake(
+                                    SCREEN_SHAKE_BOSS_DEATH_INTENSITY,
+                                    SCREEN_SHAKE_BASE_DURATION_SECONDS * 2,
+                                )
+                    achievements.record_bomb_detonation(hit_count)
 
+            drone = game.get("drone")
             for asteroid in list(game["asteroids"]):
                 if not asteroid.alive():
                     continue
@@ -351,11 +513,13 @@ def main():
                         player.consume_shield()
                         asteroid.split()
                         sounds.play("explosion")
+                        trigger_shake(SCREEN_SHAKE_EXPLOSION_INTENSITY)
                         log_event("shield_block")
                         continue
 
                     sounds.play("hit")
                     log_event("player_hit")
+                    achievements.mark_player_hit()
                     lives -= 1
 
                     if lives <= 0:
@@ -369,16 +533,59 @@ def main():
                     change_state(STATE_RESPAWNING)
                     break
 
+                if drone and drone.alive() and asteroid.collides_with(drone):
+                    drone.damage(1)
+                    asteroid.split()
+                    trigger_shake(SCREEN_SHAKE_EXPLOSION_INTENSITY)
+                    if not drone.alive():
+                        set_status("Drone destroyed", duration=2.5)
+
                 for shot in list(game["shots"]):
                     if asteroid.collides_with(shot):
                         add_score_for_asteroid(asteroid)
+                        achievements.record_asteroid_destroyed(elapsed)
                         shot.kill()
+                        was_boss = asteroid.is_boss
                         asteroid.split()
                         sounds.play("explosion")
+                        trigger_shake(SCREEN_SHAKE_EXPLOSION_INTENSITY)
+                        if was_boss:
+                            sounds.play("boss_death")
+                            trigger_shake(
+                                SCREEN_SHAKE_BOSS_DEATH_INTENSITY,
+                                SCREEN_SHAKE_BASE_DURATION_SECONDS * 2,
+                            )
                         log_event("asteroid_shot")
                         break
 
+            for notification in achievements.pop_notifications():
+                achievement_toasts.append((notification, elapsed + 4))
+
+            has_boss = any(a.is_boss for a in game["asteroids"])
+            enemy_count = len(game["asteroids"])
+            if has_boss:
+                sounds.update_music_mode("boss")
+            elif enemy_count >= 12:
+                sounds.update_music_mode("intense")
+            else:
+                sounds.update_music_mode("calm")
+
+            if online_mode and online_client is not None:
+                network_send_timer += dt
+                if network_send_timer >= NETWORK_SEND_INTERVAL_SECONDS:
+                    network_send_timer = 0
+                    player = game["player"]
+                    online_client.send_state(
+                        player.position.x,
+                        player.position.y,
+                        player.rotation,
+                        score,
+                        lives,
+                        name=player.name,
+                    )
+
         elif state == STATE_RESPAWNING:
+            sounds.update_music_mode("calm")
             respawn_countdown_timer -= dt
             if respawn_countdown_timer <= 0:
                 respawn_countdown_timer = 0
@@ -386,14 +593,18 @@ def main():
                 sounds.play("respawn")
                 log_event("player_respawn", lives_remaining=lives)
                 change_state(STATE_PLAYING)
+        elif state in (STATE_HOME, STATE_SETTINGS, STATE_PAUSED, STATE_GAME_OVER):
+            sounds.update_music_mode("calm")
 
         if state in (STATE_HOME,) or (state == STATE_SETTINGS and settings_return_state == STATE_HOME):
-            draw_home_background(screen, stars, home_ships, elapsed)
+            frame_surface = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
+            draw_home_background(frame_surface, parallax_layers, home_ships, elapsed)
         else:
-            screen.fill((0, 0, 0))
+            frame_surface = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
+            draw_parallax_background(frame_surface, parallax_layers)
             if game:
                 for item in game["drawable"]:
-                    item.draw(screen)
+                    item.draw(frame_surface)
 
                 player = game["player"]
                 shield_text = f"Shield: {player.shield_timer:.1f}s" if player.has_shield() else "Shield: off"
@@ -402,37 +613,93 @@ def main():
                     if player.speed_boost_timer > 0
                     else "Speed: off"
                 )
+                drone = game.get("drone")
+                drone_text = "Drone: down"
+                if drone and drone.alive():
+                    drone_text = f"Drone Lv{drone.level} HP {drone.health}/{drone.max_health}"
+                mode_text = "Online" if online_mode else "Solo"
                 hud_text = (
-                    f"Score: {score}  Lives: {lives}  Weapon: {player.weapon_name()}  "
-                    f"Bombs: {player.bombs}"
+                    f"{mode_text}  Wave: {wave_number}  Score: {score}  Lives: {lives}  "
+                    f"Weapon: {player.weapon_name()}  Bombs: {player.bombs}"
                 )
-                screen.blit(hud_font.render(hud_text, True, "white"), (20, 20))
-                screen.blit(hud_font.render(shield_text, True, "deepskyblue"), (20, 50))
-                screen.blit(hud_font.render(speed_text, True, "springgreen"), (20, 80))
+                frame_surface.blit(hud_font.render(hud_text, True, "white"), (20, 20))
+                frame_surface.blit(hud_font.render(shield_text, True, "deepskyblue"), (20, 48))
+                frame_surface.blit(hud_font.render(speed_text, True, "springgreen"), (20, 76))
+                frame_surface.blit(hud_font.render(drone_text, True, "#67e8f9"), (20, 104))
+
+                if online_mode and online_client is not None:
+                    for pid, data in online_client.players.items():
+                        if pid == online_client.player_id:
+                            continue
+                        draw_remote_ship(
+                            frame_surface,
+                            data.get("x", 0),
+                            data.get("y", 0),
+                            data.get("rotation", 0),
+                            data.get("color", "#ffffff"),
+                            data.get("name", "Pilot"),
+                            radius=18,
+                        )
+
+                    room_board = sorted(
+                        online_client.players.values(),
+                        key=lambda p: int(p.get("score", 0)),
+                        reverse=True,
+                    )[:6]
+                    draw_panel(frame_surface, SCREEN_WIDTH - 280, 16, 250, 180, alpha=160)
+                    frame_surface.blit(
+                        hud_font.render(f"Room {online_client.room_id}", True, "#93c5fd"),
+                        (SCREEN_WIDTH - 260, 28),
+                    )
+                    for i, entry in enumerate(room_board):
+                        name = entry.get("name", "Pilot")
+                        player_score = entry.get("score", 0)
+                        color = entry.get("color", "white")
+                        line = f"{i + 1}. {name[:10]}  {player_score}"
+                        frame_surface.blit(hud_font.render(line, True, color), (SCREEN_WIDTH - 260, 54 + i * 22))
+
+                    if online_client.global_leaderboard:
+                        draw_panel(frame_surface, SCREEN_WIDTH - 280, 204, 250, 192, alpha=150)
+                        frame_surface.blit(hud_font.render("Global", True, "#facc15"), (SCREEN_WIDTH - 260, 216))
+                        for i, entry in enumerate(online_client.global_leaderboard[:6]):
+                            line = f"{i + 1}. {entry['name'][:10]} {entry['score']}"
+                            frame_surface.blit(
+                                hud_font.render(line, True, entry.get("color", "white")),
+                                (SCREEN_WIDTH - 260, 242 + i * 22),
+                            )
 
         if state == STATE_HOME:
-            draw_center_text(screen, title_font, GAME_TITLE.upper(), 120, color="white")
-            draw_center_text(screen, sub_font, "Pilot. Survive. Split the swarm.", 170, color="lightskyblue")
-            draw_center_text(screen, sub_font, "Use arrow keys + Enter", 205, color="gray")
+            draw_center_text(frame_surface, title_font, GAME_TITLE.upper(), 110, color="white")
+            draw_center_text(frame_surface, sub_font, "Pilot. Survive. Split the swarm.", 156, color="#93c5fd")
+            draw_center_text(
+                frame_surface,
+                sub_font,
+                f"Online server: {MULTIPLAYER_SERVER_HOST}:{MULTIPLAYER_SERVER_PORT}",
+                182,
+                color="#94a3b8",
+            )
 
+            draw_panel(frame_surface, SCREEN_WIDTH // 2 - 220, 230, 440, 280)
             for i, option in enumerate(menu_options[STATE_HOME]):
-                color = "springgreen" if i == menu_index[STATE_HOME] else "white"
-                draw_center_text(screen, menu_font, option, 280 + i * 45, color=color)
+                color = "#4ade80" if i == menu_index[STATE_HOME] else "white"
+                draw_center_text(frame_surface, menu_font, option, 276 + i * 52, color=color)
 
         elif state == STATE_PAUSED:
             overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
             overlay.fill((0, 0, 0, 140))
-            screen.blit(overlay, (0, 0))
-            draw_center_text(screen, overlay_font, "PAUSED", 140, color="white")
+            frame_surface.blit(overlay, (0, 0))
+            draw_panel(frame_surface, SCREEN_WIDTH // 2 - 220, 130, 440, 320)
+            draw_center_text(frame_surface, overlay_font, "PAUSED", 180, color="white")
             for i, option in enumerate(menu_options[STATE_PAUSED]):
-                color = "springgreen" if i == menu_index[STATE_PAUSED] else "white"
-                draw_center_text(screen, menu_font, option, 240 + i * 44, color=color)
+                color = "#4ade80" if i == menu_index[STATE_PAUSED] else "white"
+                draw_center_text(frame_surface, menu_font, option, 260 + i * 42, color=color)
 
         elif state == STATE_SETTINGS:
             overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
             overlay.fill((0, 0, 0, 170))
-            screen.blit(overlay, (0, 0))
-            draw_center_text(screen, overlay_font, "SETTINGS", 120, color="white")
+            frame_surface.blit(overlay, (0, 0))
+            draw_panel(frame_surface, SCREEN_WIDTH // 2 - 290, 110, 580, 320)
+            draw_center_text(frame_surface, overlay_font, "SETTINGS", 160, color="white")
 
             sound_status = "On" if sounds.enabled else "Off"
             volume_percent = int(sounds.volume * 100)
@@ -443,31 +710,65 @@ def main():
             ]
 
             for i, option in enumerate(rendered_options):
-                color = "springgreen" if i == menu_index[STATE_SETTINGS] else "white"
-                draw_center_text(screen, menu_font, option, 230 + i * 50, color=color)
+                color = "#4ade80" if i == menu_index[STATE_SETTINGS] else "white"
+                draw_center_text(frame_surface, menu_font, option, 250 + i * 50, color=color)
 
-            draw_center_text(screen, sub_font, "Esc to return", 390, color="gray")
+            draw_center_text(frame_surface, sub_font, "Esc to return", 390, color="#94a3b8")
 
         elif state == STATE_GAME_OVER:
             overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
             overlay.fill((0, 0, 0, 160))
-            screen.blit(overlay, (0, 0))
-            draw_center_text(screen, overlay_font, "GAME OVER", 120, color="orangered")
-            draw_center_text(screen, menu_font, f"Final Score: {game_over_score}", 185, color="white")
+            frame_surface.blit(overlay, (0, 0))
+            draw_panel(frame_surface, SCREEN_WIDTH // 2 - 250, 110, 500, 360)
+            draw_center_text(frame_surface, overlay_font, "GAME OVER", 166, color="orangered")
+            draw_center_text(frame_surface, menu_font, f"Final Score: {game_over_score}", 230, color="white")
             for i, option in enumerate(menu_options[STATE_GAME_OVER]):
-                color = "springgreen" if i == menu_index[STATE_GAME_OVER] else "white"
-                draw_center_text(screen, menu_font, option, 255 + i * 44, color=color)
+                color = "#4ade80" if i == menu_index[STATE_GAME_OVER] else "white"
+                draw_center_text(frame_surface, menu_font, option, 290 + i * 46, color=color)
 
         elif state == STATE_RESPAWNING:
             overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
             overlay.fill((0, 0, 0, 110))
-            screen.blit(overlay, (0, 0))
+            frame_surface.blit(overlay, (0, 0))
             countdown_display = max(1, int(respawn_countdown_timer) + 1)
-            draw_center_text(screen, overlay_font, f"RESPAWNING {countdown_display}", SCREEN_HEIGHT // 2 - 20)
-            draw_center_text(screen, sub_font, "Get ready...", SCREEN_HEIGHT // 2 + 28, color="lightgray")
+            draw_center_text(frame_surface, overlay_font, f"RESPAWNING {countdown_display}", SCREEN_HEIGHT // 2 - 20)
+            draw_center_text(frame_surface, sub_font, "Get ready...", SCREEN_HEIGHT // 2 + 28, color="lightgray")
+
+        now_toasts = deque()
+        for notification, expiry in achievement_toasts:
+            if elapsed < expiry:
+                now_toasts.append((notification, expiry))
+        achievement_toasts = now_toasts
+
+        if achievement_toasts:
+            notification, _ = achievement_toasts[0]
+            draw_panel(frame_surface, SCREEN_WIDTH // 2 - 280, 16, 560, 64, alpha=190)
+            draw_center_text(
+                frame_surface,
+                sub_font,
+                f"Achievement Unlocked: {notification['title']} - {notification['description']}",
+                48,
+                color="#fef08a",
+            )
+
+        if status_message and elapsed < status_until:
+            draw_panel(frame_surface, SCREEN_WIDTH // 2 - 220, SCREEN_HEIGHT - 72, 440, 46, alpha=180)
+            draw_center_text(frame_surface, sub_font, status_message, SCREEN_HEIGHT - 49, color="#cbd5e1")
+
+        shake_offset = pygame.Vector2(0, 0)
+        if shake_timer > 0:
+            shake_timer -= dt
+            shake_offset.x = random.randint(-int(shake_intensity), int(shake_intensity))
+            shake_offset.y = random.randint(-int(shake_intensity), int(shake_intensity))
+            shake_intensity = max(0, shake_intensity * 0.9)
+
+        screen.fill((0, 0, 0))
+        screen.blit(frame_surface, (int(shake_offset.x), int(shake_offset.y)))
 
         pygame.display.flip()
         dt = clock.tick(60) / 1000
+
+    close_online_client()
 
 
 if __name__ == "__main__":

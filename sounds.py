@@ -12,6 +12,9 @@ class SoundManager:
         self.volume = SOUND_DEFAULT_VOLUME
         self.available = False
         self.sounds = {}
+        self.music_mode = None
+        self.music_channel = None
+        self.music_loops = {}
 
         try:
             pygame.mixer.init(frequency=44100, size=-16, channels=1)
@@ -28,12 +31,25 @@ class SoundManager:
         self.sounds["hit"] = self._generate_tone(220, 0.16, 0.25)
         self.sounds["bomb_drop"] = self._generate_tone(420, 0.1, 0.2)
         self.sounds["respawn"] = self._generate_tone(520, 0.2, 0.2)
+        self.sounds["boss_death"] = self._generate_tone(70, 0.5, 0.35, wave="saw")
+        self.sounds["drone_upgrade"] = self._generate_tone(980, 0.15, 0.2)
+
+        self.music_channel = pygame.mixer.Channel(6)
+        self.music_loops["calm"] = self._generate_tone(140, 1.2, 0.07)
+        self.music_loops["intense"] = self._generate_tone(210, 0.9, 0.09, wave="square")
+        self.music_loops["boss"] = self._generate_tone(92, 1.1, 0.1, wave="saw")
 
     def set_volume(self, volume):
         self.volume = max(0.0, min(1.0, volume))
+        if self.music_channel is not None:
+            self.music_channel.set_volume(self.volume * 0.4)
 
     def toggle_enabled(self):
         self.enabled = not self.enabled
+        if not self.enabled and self.music_channel is not None:
+            self.music_channel.stop()
+        elif self.enabled and self.music_mode is not None:
+            self.update_music_mode(self.music_mode)
 
     def play(self, name):
         if not self.available or not self.enabled:
@@ -43,6 +59,25 @@ class SoundManager:
             return
         sound.set_volume(self.volume)
         sound.play()
+
+    def update_music_mode(self, mode):
+        if not self.available:
+            return
+        if mode == self.music_mode:
+            return
+
+        self.music_mode = mode
+        if not self.enabled:
+            self.music_channel.stop()
+            return
+
+        loop = self.music_loops.get(mode)
+        if loop is None:
+            self.music_channel.stop()
+            return
+
+        loop.set_volume(self.volume * 0.4)
+        self.music_channel.play(loop, loops=-1)
 
     def _generate_tone(self, frequency, duration_seconds, amplitude, wave="sine"):
         sample_rate = 44100
